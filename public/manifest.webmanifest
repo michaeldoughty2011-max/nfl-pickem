@@ -1,0 +1,16 @@
+{
+  "name": "Pickem",
+  "short_name": "Pickem",
+  "description": "Weekly NFL pickem against the spread, with Lock of the Week, King of the Hill and live standings.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#070c14",
+  "theme_color": "#0b1626",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
