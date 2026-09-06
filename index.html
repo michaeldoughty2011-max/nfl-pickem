@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pickem</title>
+<meta name="description" content="Weekly NFL pickem against the spread, with Lock of the Week, King of the Hill, live results and season standings.">
+<meta name="theme-color" content="#0b1626">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Pickem">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="icon" href="/icon-192.png" sizes="192x192">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Source+Sans+3:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32">
+        <defs><linearGradient id="pg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#8cc4ff"></stop><stop offset="1" stop-color="#1d54e8"></stop>
+        </linearGradient></defs>
+        <path fill="url(#pg)" d="M8.4 27V5h8.9c2.7 0 4.8.7 6.2 2.1 1.5 1.4 2.2 3.3 2.2 5.7 0 2.4-.7 4.3-2.2 5.7-1.4 1.4-3.5 2.1-6.2 2.1h-3.6V27H8.4Zm5.3-11.6h3c1.2 0 2.1-.3 2.7-.8.6-.6.9-1.3.9-2.3s-.3-1.8-.9-2.3c-.6-.6-1.5-.8-2.7-.8h-3v6.2Z"></path>
+      </svg>
+    </span>
+    <div>
+      <h1 id="leagueName">Pickem</h1>
+      <p id="subline">Loading…</p>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="themeBtn" title="Switch light / dark" aria-label="Switch light or dark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+        <path d="M20 13.4A8.4 8.4 0 1 1 10.6 4a6.8 6.8 0 0 0 9.4 9.4Z"></path>
+      </svg>
+    </button>
+    <button class="icon-btn" id="refreshBtn" title="Refresh scores" aria-label="Refresh scores">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"></path>
+        <path d="M20.6 4.6v4.6h-4.6"></path>
+      </svg>
+    </button>
+    <button class="who" id="whoBtn">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+        <circle cx="12" cy="8" r="3.4"></circle>
+        <path d="M4.8 20a7.4 7.4 0 0 1 14.4 0"></path>
+      </svg>
+      <span id="whoName">Sign in</span>
+    </button>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs" role="tablist">
+  <button class="tab" role="tab" data-tab="picks" aria-selected="true">Picks</button>
+  <button class="tab" role="tab" data-tab="live" aria-selected="false">Live</button>
+  <button class="tab" role="tab" data-tab="standings" aria-selected="false">Season</button>
+  <button class="tab" role="tab" data-tab="admin" aria-selected="false">Commish</button>
+</nav>
+
+<main id="view">
+  <p class="skel">Loading this week…</p>
+</main>
+
+<footer>
+  <span id="feedStamp">—</span>
+  <span id="weekJump"></span>
+</footer>
+
+<div id="modalHost"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
