@@ -395,6 +395,8 @@ export default async (req) => {
         return await handleLogin(body);
       case "picks":
         return await handlePicks(body);
+      case "avatar":
+        return req.method === "POST" ? await handleAvatarSet(body) : await handleAvatarGet(url);
       case "admin":
         return await handleAdmin(body);
       default:
@@ -454,6 +456,7 @@ async function handleState(url) {
       name: p.name,
       hasPin: Boolean(p.pinHash),
       active: p.active !== false,
+      avatar: p.avatar || 0, // version stamp; 0 = no photo
     })),
     slate: {
       gameIds: weekDoc.gameIds,
@@ -573,6 +576,66 @@ async function requireAdmin(body) {
   if (!league.adminPinHash || league.adminPinHash !== hash("admin", pin))
     return { error: fail("Wrong commissioner PIN.", 401) };
   return { league };
+}
+
+/* ------------------------------ avatars ---------------------------- */
+/* Stored one blob per player, served with a long cache and busted by the
+   version stamp carried in /api/state. Kept out of the state payload so the
+   30-second poll stays small. */
+
+const AVATAR_TYPES = { "image/jpeg": true, "image/png": true, "image/webp": true };
+const AVATAR_MAX = 300_000; // bytes, decoded — the client resizes well below this
+
+async function handleAvatarGet(url) {
+  const id = String(url.searchParams.get("p") || "");
+  const rec = id ? await readJSON(`avatar:${id}`, null) : null;
+  if (!rec || !rec.b64) return new Response("", { status: 404 });
+  return new Response(Buffer.from(rec.b64, "base64"), {
+    headers: {
+      "content-type": rec.type || "image/jpeg",
+      "cache-control": "public, max-age=31536000, immutable",
+    },
+  });
+}
+
+async function handleAvatarSet(body) {
+  const players = await getPlayers();
+  const player = players.find((p) => p.id === body.playerId);
+  if (!player) return fail("That player is not in the league.");
+
+  // Either the player with their own PIN, or the commissioner.
+  let allowed = false;
+  if (body.adminPin) {
+    const league = await getLeague();
+    allowed = league.adminPinHash === hash("admin", String(body.adminPin).trim());
+    if (!allowed) return fail("Wrong commissioner PIN.", 401);
+  } else {
+    const pin = String(body.pin || "").trim();
+    allowed = Boolean(player.pinHash) && player.pinHash === hash(player.id, pin);
+    if (!allowed) return fail("Sign in again — that PIN doesn't match.", 401);
+  }
+
+  const dataUrl = String(body.dataUrl || "");
+
+  if (!dataUrl) {
+    await store().delete(`avatar:${player.id}`);
+    player.avatar = 0;
+    await writeJSON("players", players);
+    return json({ ok: true, avatar: 0 });
+  }
+
+  const m = /^data:([a-z/+-]+);base64,([A-Za-z0-9+/=]+)$/i.exec(dataUrl);
+  if (!m) return fail("That image didn't come through. Try a different photo.");
+  const [, type, b64] = m;
+  if (!AVATAR_TYPES[type.toLowerCase()]) return fail("Use a JPEG, PNG or WebP image.");
+  if (Math.floor((b64.length * 3) / 4) > AVATAR_MAX)
+    return fail("That image is too big even after resizing. Try another one.");
+
+  const version = Date.now();
+  await writeJSON(`avatar:${player.id}`, { type: type.toLowerCase(), b64, at: version });
+  player.avatar = version;
+  await writeJSON("players", players);
+  return json({ ok: true, avatar: version });
 }
 
 /* -------------------------------- picks ---------------------------- */
@@ -703,6 +766,7 @@ async function handleAdmin(body) {
           id,
           name,
           pinHash: prior ? prior.pinHash : "",
+          avatar: prior ? prior.avatar || 0 : 0,
           active: p.active !== false,
           createdAt: prior ? prior.createdAt : Date.now(),
         };
