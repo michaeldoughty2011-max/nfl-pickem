@@ -20,6 +20,21 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const view = $("#view");
 
+  /* Team colours, picked from each club's palette but shifted where the
+     brand primary is too dark to read on the app's dark ground. Used as a
+     tint and edge, never as text, so contrast holds in both themes. */
+  const TEAM_COLOR = {
+    ARI: "#c41e3a", ATL: "#e01933", BAL: "#6a4fd8", BUF: "#2f7ce0",
+    CAR: "#0085ca", CHI: "#e64100", CIN: "#fb4f14", CLE: "#ff6a13",
+    DAL: "#a7b3c4", DEN: "#fa6a1e", DET: "#4ca9e8", GB: "#ffb612",
+    HOU: "#d6273b", IND: "#4a90d9", JAX: "#3fa9bc", KC: "#e31837",
+    LV: "#c4cbd2", LAC: "#33a6e8", LAR: "#ffa300", MIA: "#00b0a8",
+    MIN: "#8b5fd6", NE: "#e0334d", NO: "#d3bc8d", NYG: "#3b6fd4",
+    NYJ: "#2e9e5b", PHI: "#21a0a0", PIT: "#ffc72c", SEA: "#69be28",
+    SF: "#e04a4a", TB: "#e23b3b", TEN: "#5fa9e8", WAS: "#b3474a",
+  };
+  const teamColor = (t) => TEAM_COLOR[t] || "#8892a4";
+
   /* ------------------------------ utils ----------------------------- */
 
   const esc = (s) =>
@@ -112,6 +127,109 @@
     }
     return kickoffLabel(g.kickoff);
   };
+
+  /* ------------------------------ avatars --------------------------- */
+
+  const initialsOf = (name) =>
+    String(name).trim().split(/\s+/).map((w) => w[0]).join("").slice(0, 2).toUpperCase();
+
+  const hueFor = (id) => {
+    let h = 7;
+    for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) % 360;
+    return h;
+  };
+
+  function avatarHtml(p, cls = "") {
+    if (!p) return "";
+    if (p.avatar)
+      return `<span class="avatar ${cls}"><img src="/api/avatar?p=${encodeURIComponent(
+        p.id
+      )}&v=${p.avatar}" alt="" loading="lazy"></span>`;
+    return `<span class="avatar ${cls}" style="background:hsl(${hueFor(
+      p.id
+    )} 50% 40%);color:#fff">${esc(initialsOf(p.name))}</span>`;
+  }
+
+  const loadImage = (file) =>
+    new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(img);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error("That file didn't open as an image."));
+      };
+      img.src = url;
+    });
+
+  /* Square-crop and shrink in the browser so a 4 MB phone photo becomes a
+     ~15 KB upload. */
+  async function shrinkImage(file, size = 176) {
+    const img = await loadImage(file);
+    const side = Math.min(img.naturalWidth, img.naturalHeight);
+    if (!side) throw new Error("That image came through empty.");
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(
+      img,
+      (img.naturalWidth - side) / 2,
+      (img.naturalHeight - side) / 2,
+      side,
+      side,
+      0,
+      0,
+      size,
+      size
+    );
+    return canvas.toDataURL("image/jpeg", 0.82);
+  }
+
+  function pickImageFile() {
+    return new Promise((resolve) => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/*";
+      input.onchange = () => resolve(input.files && input.files[0]);
+      input.click();
+    });
+  }
+
+  async function changePhoto(playerId, { adminPin } = {}) {
+    const file = await pickImageFile();
+    if (!file) return;
+    try {
+      const dataUrl = await shrinkImage(file);
+      await api("/api/avatar", {
+        playerId,
+        dataUrl,
+        ...(adminPin ? { adminPin } : { pin: S.me.pin }),
+      });
+      toast("Photo updated.", "info");
+      closeModal();
+      await load(S.week);
+    } catch (err) {
+      toast(err.message, "bad");
+    }
+  }
+
+  async function removePhoto(playerId, { adminPin } = {}) {
+    try {
+      await api("/api/avatar", {
+        playerId,
+        dataUrl: "",
+        ...(adminPin ? { adminPin } : { pin: S.me.pin }),
+      });
+      toast("Photo removed.", "info");
+      closeModal();
+      await load(S.week);
+    } catch (err) {
+      toast(err.message, "bad");
+    }
+  }
 
   const linesNote = (d) => {
     if (d.slate.linesFrozen) return "Lines are final for this week.";
@@ -260,7 +378,11 @@
       : `Week ${d.week} · open`;
 
     const me = S.me && d.players.find((p) => p.id === S.me.playerId);
-    $("#whoName").textContent = me ? me.name : "Sign in";
+    $("#whoBtn").innerHTML = me
+      ? `${avatarHtml(me, "sm")}<span>${esc(me.name)}</span>`
+      : `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+           stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="8" r="3.4"></circle>
+           <path d="M4.8 20a7.4 7.4 0 0 1 14.4 0"></path></svg><span>Sign in</span>`;
 
     const age = d.feed.at ? Math.round((Date.now() - d.feed.at) / 1000) : null;
     $("#feedStamp").textContent = d.feed.error
@@ -474,13 +596,15 @@
     const dots = rows
       .map((r) => `<i class="${r.res === "pending" ? "" : r.res}"></i>`)
       .join("");
+    // Before kickoff a pick carries no result, so it wears its team's colour.
+    // Once the game starts, win/push/loss takes over.
     const tags = rows
-      .map(
-        (r) =>
-          `<span class="tag ${r.res === "pending" ? "" : r.res}">${esc(r.name)} · ${esc(r.pick)}${
-            r.isLock ? '<span class="lk">🔒</span>' : ""
-          }</span>`
-      )
+      .map((r) => {
+        const pending = r.res === "pending";
+        return `<span class="tag ${pending ? "team" : r.res}"${
+          pending ? ` style="--team:${teamColor(r.pick)}"` : ""
+        }>${esc(r.name)} · ${esc(r.pick)}${r.isLock ? '<span class="lk">🔒</span>' : ""}</span>`;
+      })
       .join("");
 
     return `<button class="reveal" data-reveal="${g.id}" aria-expanded="${open}">
@@ -658,9 +782,9 @@
             const lockTeam = lockGame && r.entry.picks[lockGame.id];
             return `<tr class="${r.player.id === meId ? "me" : ""}">
               <td class="rank">${i + 1}</td>
-              <td class="name">${esc(r.player.name)}${
-              r.entry ? "" : ' <span class="pill">no entry</span>'
-            }</td>
+              <td class="name"><span class="name-cell">${avatarHtml(r.player, "sm")}<span>${esc(
+              r.player.name
+            )}</span>${r.entry ? "" : ' <span class="pill">no entry</span>'}</span></td>
               <td class="num">${r.entry ? fmtRec(r.rec) : "—"}${
               r.entry && r.rec.pending
                 ? `<span style="color:var(--ink-3)"> · ${r.rec.pending} left</span>`
@@ -724,6 +848,7 @@
             <span class="team-code" style="color:${
               r.out ? "var(--ink-3)" : r.res === "win" ? "var(--win)" : r.res === "loss" ? "var(--loss)" : "var(--ink)"
             }">${r.thisWeek ? esc(r.thisWeek.team) : "—"}</span>
+            ${avatarHtml(r.p, "sm")}
             <span>${esc(r.p.name)}${
             r.thisWeek ? ` <span style="color:var(--ink-3)">${esc(r.thisWeek.opponent)}</span>` : ""
           }</span>
@@ -829,7 +954,9 @@
             const out = k && k.eliminatedWeek;
             return `<tr class="${s.p.id === meId ? "me" : ""}">
             <td class="rank">${i + 1}</td>
-            <td class="name">${esc(s.p.name)}</td>
+            <td class="name"><span class="name-cell">${avatarHtml(s.p, "sm")}<span>${esc(
+              s.p.name
+            )}</span></span></td>
             <td class="num">${s.t.w}-${s.t.l}${s.t.t ? `-${s.t.t}` : ""}</td>
             <td class="num">${pct(s.t.w, s.t.l, s.t.t)}</td>
             <td class="num">${fmtWins(s.t.weeks)}</td>
@@ -952,8 +1079,12 @@
     const playersRows = d.players
       .map(
         (p) => `<div class="player-row">
+          ${avatarHtml(p)}
           <input type="text" class="grow" data-pname="${p.id}" value="${esc(p.name)}" maxlength="32">
           <span class="pill">${p.hasPin ? "PIN set" : "no PIN yet"}</span>
+          <button class="btn ghost" data-photo="${p.id}" style="padding:6px 10px">${
+          p.avatar ? "Photo ✓" : "Photo"
+        }</button>
           <button class="btn ghost" data-resetpin="${p.id}" style="padding:6px 10px">Reset PIN</button>
           <button class="btn danger" data-drop="${p.id}" style="padding:6px 10px">Remove</button>
         </div>`
@@ -1085,6 +1216,10 @@
       savePlayers(rows);
     };
 
+    view.querySelectorAll("[data-photo]").forEach((b) => {
+      b.onclick = () => changePhoto(b.dataset.photo, { adminPin: S.adminPin });
+    });
+
     view.querySelectorAll("[data-drop]").forEach((b) => {
       b.onclick = () => savePlayers(collectPlayers().filter((p) => p.id !== b.dataset.drop));
     });
@@ -1141,13 +1276,40 @@
   function openSignIn() {
     const d = S.data;
     if (!d || !d.league.configured) return;
+    const me = S.me && d.players.find((p) => p.id === S.me.playerId);
+
+    const photoBlock = me
+      ? `<div class="photo-row">
+           ${avatarHtml(me, "lg")}
+           <div class="grow">
+             <strong class="display" style="font-size:22px">${esc(me.name)}</strong>
+             <div class="row" style="margin-top:6px">
+               <button class="btn ghost" id="photoPick" style="padding:7px 12px">${
+                 me.avatar ? "Change photo" : "Add a photo"
+               }</button>
+               ${
+                 me.avatar
+                   ? `<button class="btn danger" id="photoDrop" style="padding:7px 12px">Remove</button>`
+                   : ""
+               }
+             </div>
+           </div>
+         </div>
+         <p class="note">Your photo shows up next to your name on the board. It's resized on your phone before it uploads, so a full-size camera roll picture is fine.</p>
+         <hr class="rule">`
+      : "";
+
     modal(`
-      <h2>Who are you?</h2>
+      ${photoBlock}
+      <h2>${me ? "Switch player" : "Who are you?"}</h2>
       <div class="chooser">${d.players
         .filter((p) => p.active)
-        .map((p) => `<button data-pick-player="${p.id}">${esc(p.name)} ${
-          p.hasPin ? "" : '<span class="pill">first time</span>'
-        }</button>`)
+        .map(
+          (p) =>
+            `<button data-pick-player="${p.id}">${avatarHtml(p, "sm")}${esc(p.name)} ${
+              p.hasPin ? "" : '<span class="pill">first time</span>'
+            }</button>`
+        )
         .join("")}</div>
       ${
         S.me
@@ -1158,6 +1320,11 @@
     $("#modalHost")
       .querySelectorAll("[data-pick-player]")
       .forEach((b) => (b.onclick = () => askPin(b.dataset.pickPlayer)));
+
+    const pick = $("#photoPick");
+    if (pick) pick.onclick = () => changePhoto(me.id);
+    const drop = $("#photoDrop");
+    if (drop) drop.onclick = () => removePhoto(me.id);
 
     const out = $("#signOut");
     if (out)
