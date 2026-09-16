@@ -7,6 +7,7 @@
     week: null,
     tab: "picks",
     me: null,          // { playerId, pin }
+    mine: null,        // own unsealed entry + KOTH state, from /api/mine
     adminPin: null,
     draft: null,       // { picks:{gameId:team}, lock:string, koth:string }
     dirty: false,
@@ -102,6 +103,29 @@
   const gameForTeam = (games, team) =>
     games.find((g) => g.home === team || g.away === team) || null;
 
+  /* Your own season-to-date record picking a given team, against the spread.
+     Built from the season payload, which the Picks tab now loads too. */
+  function myTeamRecords() {
+    const id = S.me && S.me.playerId;
+    if (!id || !S.season) return null;
+    const rec = {};
+    for (const wk of S.season) {
+      const entry = wk.picks[id];
+      if (!entry) continue;
+      for (const g of wk.games) {
+        const pick = entry.picks[g.id];
+        if (!pick || g.state !== "final") continue;
+        const r = resultFor(g, pick);
+        if (r !== "win" && r !== "loss" && r !== "push") continue;
+        rec[pick] = rec[pick] || { w: 0, l: 0, t: 0 };
+        if (r === "win") rec[pick].w++;
+        else if (r === "loss") rec[pick].l++;
+        else rec[pick].t++;
+      }
+    }
+    return rec;
+  }
+
   const teamsPlaying = (games) => {
     const out = [];
     for (const g of games) {
@@ -111,13 +135,37 @@
     return out.sort((a, b) => a.team.localeCompare(b.team));
   };
 
+  // Prefer the unsealed copy of my own KOTH state when it's loaded.
   const myKoth = () => {
+    if (S.mine && S.mine.koth && S.mine.week === (S.data && S.data.week)) return S.mine.koth;
     const id = S.me && S.me.playerId;
     return (id && S.data && S.data.koth && S.data.koth[id]) || null;
   };
 
+  const myEntry = () => {
+    const id = S.me && S.me.playerId;
+    if (!id || !S.data) return null;
+    if (S.mine && S.mine.week === S.data.week) return S.mine.entry;
+    return S.data.picks[id] || null;
+  };
+
   const kothAliveFor = (info, week) =>
     !info || info.alive || (info.eliminatedWeek && info.eliminatedWeek >= week);
+
+  /* Live drive detail. The feed only fills these while a game is in progress,
+     and not every game carries every field, so render whatever is there. */
+  const driveLine = (g) => {
+    if (g.state !== "live") return "";
+    const bits = [];
+    if (g.possession) bits.push(`<strong>${esc(g.possession)}</strong> ball`);
+    if (g.down) bits.push(esc(g.down));
+    const spot = [g.yardSide, g.yardLine].filter(Boolean).join(" ");
+    if (spot) bits.push(esc(spot));
+    if (!bits.length) return "";
+    return `<span class="drive${g.redZone ? " rz" : ""}">${
+      g.redZone ? "<em>RED ZONE</em> · " : ""
+    }${bits.join(" · ")}</span>`;
+  };
 
   const statusLabel = (g) => {
     if (g.state === "final") return g.overtime ? "Final / OT" : "Final";
@@ -318,8 +366,10 @@
       const data = await api(`/api/state${q}`);
       S.data = data;
       S.week = data.week;
+      if (!S.mine || S.mine.week !== data.week) S.mine = null;
       if (!S.draft || S.draft.week !== data.week) resetDraft();
       render();
+      loadMine();
     } catch (err) {
       if (!S.data) {
         view.innerHTML = `<div class="banner bad">Couldn't reach the league: ${esc(err.message)}</div>`;
@@ -332,8 +382,24 @@
     }
   }
 
+  async function loadMine() {
+    if (!S.me || !S.data) return;
+    try {
+      const res = await api("/api/mine", {
+        playerId: S.me.playerId,
+        pin: S.me.pin,
+        week: S.data.week,
+      });
+      S.mine = { week: res.week, entry: res.entry, koth: res.koth };
+      resetDraft();
+      render();
+    } catch {
+      /* stay with the sealed view */
+    }
+  }
+
   function resetDraft() {
-    const mine = S.me && S.data && S.data.picks[S.me.playerId];
+    const mine = myEntry();
     S.draft = {
       week: S.data ? S.data.week : null,
       picks: mine ? { ...mine.picks } : {},
@@ -458,6 +524,7 @@
     const d = S.data;
     const slate = slateOf(d);
     const parts = [];
+    ensureSeason(); // fills in your per-team records
 
     if (!d.slate.published || !slate.length) {
       view.innerHTML = `
@@ -467,7 +534,7 @@
 
     const meId = S.me && S.me.playerId;
     const editable = !d.locked && !!meId;
-    const mine = meId ? d.picks[meId] : null;
+    const mine = myEntry();
 
     if (!meId) {
       parts.push(
@@ -534,13 +601,22 @@
     const res = resultFor(g, chosen);
     const started = g.state !== "pre";
 
+    const records = S.teamRecords;
     const teamBtn = (team, score) => {
       const sel = chosen === team;
       const cls = ["team"];
       if (sel && started && res !== "pending" && res !== "none") cls.push(`result-${res}`);
+      const r = records && records[team];
       return `<button class="${cls.join(" ")}" ${editable ? "" : "disabled"} data-game="${g.id}" data-team="${team}"
         aria-pressed="${sel}">
-        <span><span class="abbr">${team}</span> <span class="line num">${esc(lineFor(g, team))}</span></span>
+        <span><span class="abbr">${team}</span> <span class="line num">${esc(lineFor(g, team))}</span>
+        ${
+          r
+            ? `<span class="yourrec num" title="Your record picking ${team} this season">you ${r.w}-${
+                r.l
+              }${r.t ? `-${r.t}` : ""}</span>`
+            : ""
+        }</span>
         ${started ? `<span class="score">${score}</span>` : ""}
       </button>`;
     };
@@ -559,6 +635,7 @@
         ${teamBtn(g.away, g.awayScore)}
         ${teamBtn(g.home, g.homeScore)}
       </div>
+      ${driveLine(g) ? `<div class="drive-row">${driveLine(g)}</div>` : ""}
       <div class="game-foot">
         ${
           editable
@@ -624,18 +701,24 @@
     if (!meId) return "";
 
     const info = myKoth();
+    if (info && info.excluded) return "";
+
     const alive = kothAliveFor(info, d.week);
+    const buyback = Boolean(info && info.buybackWeek === d.week && !alive);
     const mine = editable ? S.draft.koth : entry && entry.koth;
     const game = mine ? gameForTeam(d.games, mine) : null;
     const res = mine ? kothResultFor(game, mine) : "none";
+    const entryNo = info ? (buyback && mine ? 2 : info.entry || 1) : 1;
 
-    if (!alive) {
+    if (!alive && !buyback) {
       return `<section class="section">
         <div class="section-head"><div><p class="eyebrow">King of the Hill</p><h2>You're out</h2></div>
           <span class="pill out">Out · Week ${info.eliminatedWeek}</span></div>
         <div class="panel panel-pad"><p class="note">${esc(
           info.reason || "Eliminated"
-        )} in Week ${info.eliminatedWeek}. You still pick every game against the spread — KOTH just isn't part of your week any more.</p></div>
+        )} in Week ${info.eliminatedWeek}${
+        info.entriesUsed > 1 ? " on your second entry" : ""
+      }. You still pick every game against the spread — KOTH just isn't part of your week any more.</p></div>
       </section>`;
     }
 
@@ -671,10 +754,20 @@
           .join(" ")}</p>`
       : "";
 
+    const banner = buyback
+      ? `<div class="banner warn"><strong>This is your buyback week.</strong> ${esc(
+          info.reason || "You were knocked out"
+        )} in Week ${info.eliminatedWeek}. Taking a team here starts your <strong>second and final</strong> KOTH entry — and it only works this week. Skip it and you're done for the season. Every team you've already used stays burned.</div>`
+      : `<div class="banner info">Straight up, no spread — your team just has to win. One loss and your KOTH season is over, and you can't use the same team twice.${
+          entryNo > 1 ? " You're on your <strong>second entry</strong>." : ""
+        }</div>`;
+
     return `<section class="section">
-      <div class="section-head"><div><p class="eyebrow">King of the Hill</p>
-        <h2>Pick one winner</h2></div>${status}</div>
-      <div class="banner info">Straight up, no spread — your team just has to win. One loss and your KOTH season is over, and you can't use the same team twice.</div>
+      <div class="section-head"><div><p class="eyebrow">King of the Hill${
+        entryNo > 1 ? " · 2nd entry" : ""
+      }</p>
+        <h2>${buyback ? "Buy back in?" : "Pick one winner"}</h2></div>${status}</div>
+      ${banner}
       <div class="panel">${grid}${history}</div>
     </section>`;
   }
@@ -826,36 +919,74 @@
   function kothBoard() {
     const d = S.data;
     if (!d.koth) return "";
-    const players = d.players.filter((p) => p.active);
+    const players = d.players.filter((p) => p.active && p.koth !== false);
+    if (!players.length) return "";
     const alive = players.filter((p) => kothAliveFor(d.koth[p.id], d.week + 1));
+    const sealed = Boolean(d.kothSealed);
+    const meId = S.me && S.me.playerId;
 
     const rows = players
       .map((p) => {
         const info = d.koth[p.id] || { used: [], alive: true, eliminatedWeek: 0 };
-        const thisWeek = info.used.find((u) => u.week === d.week);
+        let thisWeek = info.used.find((u) => u.week === d.week);
+        // My own pick is never hidden from me.
+        if (sealed && p.id === meId && S.mine && S.mine.koth) {
+          thisWeek = S.mine.koth.used.find((u) => u.week === d.week) || thisWeek;
+        }
         const out = !kothAliveFor(info, d.week + 1);
-        const res = thisWeek ? thisWeek.result : "none";
-        return { p, info, thisWeek, out, res };
+        const submitted = Boolean(
+          thisWeek || (d.picks[p.id] && (d.picks[p.id].kothIn || d.picks[p.id].koth))
+        );
+        return { p, info, thisWeek, out, submitted, res: thisWeek ? thisWeek.result : "none" };
       })
       .sort((a, b) => a.out - b.out || a.p.name.localeCompare(b.p.name));
 
+    const code = (r) => {
+      if (r.out) return "—";
+      if (r.thisWeek && !r.thisWeek.hidden) return esc(r.thisWeek.team);
+      if (r.submitted) return "🔒";
+      return "—";
+    };
+
     return `<section class="section">
-      <div class="section-head"><div><p class="eyebrow">King of the Hill</p><h2>Still standing</h2></div>
+      <div class="section-head"><div><p class="eyebrow">King of the Hill${
+        sealed ? " · sealed" : ""
+      }</p><h2>Still standing</h2></div>
         <span class="pill alive">${alive.length} alive</span></div>
+      ${
+        sealed
+          ? `<div class="banner info">KOTH picks stay hidden until kickoff${
+              d.kothRevealAt ? ` at ${esc(kickoffLabel(d.kothRevealAt))}` : ""
+            }. You can see who's in, not what they took.</div>`
+          : ""
+      }
       <div class="panel">${rows
         .map(
           (r) => `<div class="crown-row">
             <span class="team-code" style="color:${
-              r.out ? "var(--ink-3)" : r.res === "win" ? "var(--win)" : r.res === "loss" ? "var(--loss)" : "var(--ink)"
-            }">${r.thisWeek ? esc(r.thisWeek.team) : "—"}</span>
+              r.out
+                ? "var(--ink-3)"
+                : r.res === "win"
+                ? "var(--win)"
+                : r.res === "loss"
+                ? "var(--loss)"
+                : "var(--ink)"
+            }">${code(r)}</span>
             ${avatarHtml(r.p, "sm")}
             <span>${esc(r.p.name)}${
-            r.thisWeek ? ` <span style="color:var(--ink-3)">${esc(r.thisWeek.opponent)}</span>` : ""
+            r.info.entry > 1 ? ' <span class="pill">2nd</span>' : ""
+          }${
+            r.thisWeek && !r.thisWeek.hidden
+              ? ` <span style="color:var(--ink-3)">${esc(r.thisWeek.opponent || "")}</span>`
+              : ""
           }</span>
             <span class="trail">${
               r.out
                 ? `<span class="loss">out wk ${r.info.eliminatedWeek}</span>`
+                : sealed && !r.submitted
+                ? `<span>no pick yet</span>`
                 : r.info.used
+                    .filter((u) => !u.hidden)
                     .slice(-6)
                     .map(
                       (u) =>
@@ -884,7 +1015,8 @@
       toast(err.message, "bad");
     } finally {
       S.seasonLoading = false;
-      if (S.tab === "standings") renderStandings();
+      S.teamRecords = myTeamRecords();
+      render();
     }
   }
 
@@ -962,9 +1094,15 @@
             <td class="num">${fmtWins(s.t.weeks)}</td>
             <td class="num">${s.t.lockW}-${s.t.lockL}</td>
             <td>${
-              out
-                ? `<span class="pill out">Out W${k.eliminatedWeek}</span>`
-                : `<span class="pill alive">Alive</span>`
+              k && k.excluded
+                ? `<span class="pill">not in</span>`
+                : out
+                ? `<span class="pill out">Out W${k.eliminatedWeek}${
+                    k.entriesUsed > 1 ? " · 2nd" : ""
+                  }</span>`
+                : `<span class="pill alive">Alive${
+                    k && k.entry > 1 ? " · 2nd" : ""
+                  }</span>`
             }</td></tr>`;
           })
           .join("")}</tbody></table></div></div>
@@ -1024,7 +1162,85 @@
           <div class="stat"><dt>Picks</dt><dd class="num">${totalPicks}</dd></div>
         </dl>
         <p class="note">Every pick anyone has made this season, against the closing line. Beating .500 as a group is harder than it looks.</p>
-      </section>`;
+      </section>
+      ${earnedStatus(standing, koth)}`;
+  }
+
+  /* --------------------------- earned status ------------------------ */
+  /* Money in, money back. Everyone is down the pool buy-in; KOTH players are
+     down a second one, and a buyback is a third. A week won pays 280, and a
+     week split pays that share of it. */
+
+  const POOL_BUYIN = 410;
+  const KOTH_BUYIN = 50;
+  const WEEK_WIN = 280;
+
+  function earnedStatus(standing, koth) {
+    const rows = standing
+      .map((s) => {
+        const k = koth[s.p.id];
+        const inKoth = !(k && k.excluded);
+        const buybacks = Math.max(0, (k && k.entriesUsed ? k.entriesUsed : 1) - 1);
+        const base = -POOL_BUYIN - (inKoth ? KOTH_BUYIN : 0) - buybacks * KOTH_BUYIN;
+        const won = Math.round(s.t.weeks * WEEK_WIN);
+        return { p: s.p, base, won, weeks: s.t.weeks, buybacks, inKoth, total: base + won };
+      })
+      .sort((a, b) => b.total - a.total || a.p.name.localeCompare(b.p.name));
+
+    if (!rows.length) return "";
+
+    // Pad the domain so the longest bar doesn't run to the very edge.
+    const lo = Math.min(0, ...rows.map((r) => r.total)) * 1.08;
+    const hi = Math.max(0, ...rows.map((r) => r.total)) * 1.08;
+    const span = hi - lo || 1;
+    const pos = (v) => ((v - lo) / span) * 100;
+    // Keep the zero rule inside the track so it stays visible when every
+    // total is on one side of it.
+    const zero = Math.min(99.5, Math.max(0.5, pos(0)));
+
+    const bar = (r) => {
+      const v = pos(r.total);
+      const neg = r.total < 0;
+      const left = neg ? v : zero;
+      const width = Math.max(0.6, neg ? zero - v : v - zero);
+      return `<span class="bar ${neg ? "neg" : "pos"}" style="left:${left}%;width:${width}%"></span>`;
+    };
+
+    return `<section class="section">
+      <div class="section-head"><div><p class="eyebrow">Money</p><h2>Earned status</h2></div>
+        <span class="eyebrow">buy-in to date</span></div>
+      <div class="panel">
+        <div class="chart" role="img" aria-label="Earned status by player">
+          ${rows
+            .map(
+              (r) => `<div class="chart-row">
+                <span class="chart-name">${avatarHtml(r.p, "sm")}<span>${esc(r.p.name)}</span></span>
+                <span class="track"><span class="zero" style="left:${zero}%"></span>${bar(r)}</span>
+                <span class="chart-val num ${r.total < 0 ? "neg" : "pos"}">${
+                r.total > 0 ? "+" : ""
+              }${r.total}</span>
+              </div>`
+            )
+            .join("")}
+        </div>
+        <div class="table-wrap"><table class="mini">
+          <thead><tr><th>Player</th><th class="num">Buy-in</th>
+            <th class="num">Won</th><th class="num">Net</th></tr></thead>
+          <tbody>${rows
+            .map(
+              (r) => `<tr><td class="name">${esc(r.p.name)}${
+                r.buybacks ? ' <span class="pill">buyback</span>' : ""
+              }${r.inKoth ? "" : ' <span class="pill">no KOTH</span>'}</td>
+              <td class="num">${r.base}</td>
+              <td class="num">${r.won ? `+${r.won}` : "0"}</td>
+              <td class="num ${r.total < 0 ? "neg" : "pos"}">${r.total > 0 ? "+" : ""}${r.total}</td></tr>`
+            )
+            .join("")}</tbody>
+        </table></div>
+      </div>
+      <p class="note">Everyone is out ${POOL_BUYIN} for the pool, plus ${KOTH_BUYIN} for a KOTH entry and another ${KOTH_BUYIN} for a buyback. A week won pays ${WEEK_WIN}; a split week pays that share.</p>
+      <p class="note"><strong>Not counted yet:</strong> +700 to whoever wins the season-long win-loss, and at least +650 to the King of the Hill winner. Both land once there's a winner to give them to.</p>
+    </section>`;
   }
 
   /* ------------------------------ admin ----------------------------- */
@@ -1085,6 +1301,8 @@
           <button class="btn ghost" data-photo="${p.id}" style="padding:6px 10px">${
           p.avatar ? "Photo ✓" : "Photo"
         }</button>
+          <button class="btn ghost" data-kothin="${p.id}" data-on="${p.koth !== false}"
+            style="padding:6px 10px">KOTH ${p.koth === false ? "off" : "on"}</button>
           <button class="btn ghost" data-resetpin="${p.id}" style="padding:6px 10px">Reset PIN</button>
           <button class="btn danger" data-drop="${p.id}" style="padding:6px 10px">Remove</button>
         </div>`
@@ -1125,6 +1343,27 @@
             <button class="btn ghost" id="toggleOpen">${
               d.slate.reopened ? "Re-lock the week" : "Reopen picks"
             }</button>
+          </div>
+          <hr class="rule">
+          <div class="row">
+            <span class="grow note">${
+              d.slate.linesFrozen
+                ? "Lines are locked for this week."
+                : `Lines track the book until ${esc(
+                    d.linesLockAt ? kickoffLabel(d.linesLockAt) : "the deadline"
+                  )}, then lock themselves.`
+            }${
+      (d.slate.missingLines || []).length
+        ? ` <strong style="color:var(--push)">${d.slate.missingLines.length} game${
+            d.slate.missingLines.length > 1 ? "s have" : " has"
+          } no line from the book yet.</strong>`
+        : ""
+    }</span>
+            ${
+              d.slate.linesFrozen
+                ? ""
+                : `<button class="btn ghost" id="freezeLines">Lock lines now</button>`
+            }
           </div>
           <hr class="rule">
           <div class="row">
@@ -1206,6 +1445,24 @@
       }
     };
 
+    const freeze = $("#freezeLines");
+    if (freeze)
+      freeze.onclick = async () => {
+        freeze.disabled = true;
+        try {
+          const r = await api("/api/admin", {
+            adminPin: S.adminPin,
+            action: "freezeLines",
+            week: d.week,
+          });
+          toast(`Lines locked — ${r.frozen} of ${r.of} games.`, "info");
+          await load(S.week);
+        } catch (err) {
+          toast(err.message, "bad");
+          freeze.disabled = false;
+        }
+      };
+
     $("#pickFor").onclick = () => openPickForModal();
 
     $("#addPlayer").onclick = () => {
@@ -1218,6 +1475,23 @@
 
     view.querySelectorAll("[data-photo]").forEach((b) => {
       b.onclick = () => changePhoto(b.dataset.photo, { adminPin: S.adminPin });
+    });
+
+    view.querySelectorAll("[data-kothin]").forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await api("/api/admin", {
+            adminPin: S.adminPin,
+            action: "setKothIn",
+            playerId: b.dataset.kothin,
+            inKoth: b.dataset.on !== "true",
+          });
+          S.season = null;
+          await load(S.week);
+        } catch (err) {
+          toast(err.message, "bad");
+        }
+      };
     });
 
     view.querySelectorAll("[data-drop]").forEach((b) => {
@@ -1403,13 +1677,19 @@
       koth: existing ? existing.koth || "" : "",
     };
     const info = (d.koth && d.koth[playerId]) || { used: [], alive: true, eliminatedWeek: 0 };
-    const needsKoth = kothAliveFor(info, d.week);
-    const spent = new Set(info.used.filter((u) => u.week !== d.week).map((u) => u.team));
+    const buyback = Boolean(info.buybackWeek === d.week && !info.alive);
+    const requireKoth = !info.excluded && kothAliveFor(info, d.week);
+    const needsKoth = requireKoth || buyback;
+    const spent = new Set(
+      info.used.filter((u) => u.week !== d.week && u.team).map((u) => u.team)
+    );
 
     const paint = () => {
       const done = slate.filter((g) => draft.picks[g.id]).length;
       const kothPicker = needsKoth
-        ? `<div class="field"><label for="akoth">King of the Hill</label>
+        ? `<div class="field"><label for="akoth">King of the Hill${
+            buyback ? " — buyback (2nd entry)" : ""
+          }</label>
              <select id="akoth">
                <option value="">— pick a team —</option>
                ${teamsPlaying(d.games)
@@ -1447,7 +1727,7 @@
         draft.lock ? " · lock set" : ""
       }</span>
           <button class="btn" id="apSave" ${
-            done === slate.length && draft.lock && (!needsKoth || draft.koth) ? "" : "disabled"
+            done === slate.length && draft.lock && (!requireKoth || draft.koth) ? "" : "disabled"
           }>Save</button></div>
         ${existing ? `<button class="btn danger" id="apClear">Delete this entry</button>` : ""}`);
 

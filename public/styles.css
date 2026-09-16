@@ -527,6 +527,78 @@ textarea { resize: vertical; min-height: 96px; font-family: inherit; }
 .crown-row .trail span.loss { background: var(--loss-bg); color: var(--loss); }
 .crown-row .trail span.push { background: var(--push-bg); color: var(--push); }
 
+/* live drive detail */
+.drive-row {
+  padding: 0 12px 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+  letter-spacing: .02em;
+}
+.drive em { font-style: normal; font-weight: 700; color: var(--live); }
+.drive.rz { color: var(--ink); }
+
+/* your record with a team, on the pick buttons */
+.yourrec {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .03em;
+  color: var(--ink-3);
+}
+
+/* ------------------------- earned status chart ---------------------- */
+
+.chart { display: flex; flex-direction: column; gap: 2px; padding: 12px; }
+
+.chart-row {
+  display: grid;
+  grid-template-columns: minmax(84px, 26%) 1fr minmax(52px, auto);
+  align-items: center;
+  gap: 10px;
+}
+
+.chart-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 14px;
+}
+.chart-name > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.track {
+  position: relative;
+  display: block;
+  height: 20px;
+  background: var(--sunken);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.track .zero {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line-strong);
+}
+.track .bar {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  border-radius: 3px;
+}
+.track .bar.neg { background: var(--loss); }
+.track .bar.pos { background: var(--win); }
+
+.chart-val { font-size: 14px; font-weight: 700; text-align: right; }
+.chart-val.neg, td.num.neg { color: var(--loss); }
+.chart-val.pos, td.num.pos { color: var(--win); }
+
+table.mini { font-size: 13px; border-top: 1px solid var(--line); }
+table.mini th, table.mini td { padding: 7px 12px; }
+
 .tag {
   display: inline-flex;
   align-items: center;
