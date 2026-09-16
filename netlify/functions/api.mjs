@@ -48,9 +48,15 @@ function normalizeGame(raw) {
   const m = raw.metadata || {};
   const home = m.home_team;
   const away = m.away_team;
-  const lines = m.pickem_spread || m.spread || {};
-  const spreadHome =
-    typeof lines[home] === "number" ? lines[home] : null; // negative = home favored
+  // Negative = home favored. The feed sometimes carries a pickem_spread object
+  // with no entry for a given team, so fall through value by value rather than
+  // object by object — otherwise one game with a gap has no line at all.
+  const spreadHome = (() => {
+    const sources = [m.pickem_spread, m.spread];
+    for (const s of sources) if (s && typeof s[home] === "number") return s[home];
+    for (const s of sources) if (s && typeof s[away] === "number") return -s[away];
+    return null;
+  })();
 
   const quarters = (side) =>
     [1, 2, 3, 4].reduce((t, q) => t + (Number(m[`${side}_score_quarter${q}`]) || 0), 0) +
@@ -77,6 +83,9 @@ function normalizeGame(raw) {
     quarter: m.quarter || "",
     clock: m.time_remaining || "",
     possession: m.possession || "",
+    down: m.down_and_distance || "",
+    yardLine: m.yard_line === 0 || m.yard_line ? String(m.yard_line) : "",
+    yardSide: m.yard_line_territory || "",
     redZone: Boolean(m.red_zone),
     overtime: Boolean(m.is_overtime),
     canceled: Boolean(m.canceled),
@@ -124,9 +133,27 @@ async function getLeague() {
   return (await readJSON("league", null)) || emptyLeague();
 }
 
+/* Players the commissioner has taken out of KOTH. Applied once, then the
+   Commish tab's per-player toggle owns it. */
+const KOTH_OUT_ON_UPGRADE = ["bc"];
+
 async function getPlayers() {
   const p = await readJSON("players", []);
-  return Array.isArray(p) ? p : [];
+  if (!Array.isArray(p) || !p.length) return [];
+  const league = await readJSON("league", null);
+  if (league && !league.kothOptOutApplied) {
+    let touched = false;
+    for (const player of p) {
+      if (KOTH_OUT_ON_UPGRADE.includes(player.id) && player.koth !== false) {
+        player.koth = false;
+        touched = true;
+      }
+    }
+    league.kothOptOutApplied = true;
+    await writeJSON("league", league);
+    if (touched) await writeJSON("players", p);
+  }
+  return p;
 }
 
 async function getPicks(week) {
@@ -237,37 +264,34 @@ function applyLines(games, weekDoc) {
 
 async function syncLines(week, weekDoc, games) {
   if (!weekDoc.published || !weekDoc.gameIds.length) return weekDoc;
-  if (weekDoc.linesFrozen) return weekDoc;
 
   const deadline = linesLockAt(weekDoc, games);
   const past = deadline !== null && Date.now() >= deadline;
-  const held = weekDoc.lines || {};
-  const haveAll = weekDoc.gameIds.every((id) => held[id] !== undefined);
+  const held = { ...(weekDoc.lines || {}) };
+  let changed = false;
 
-  // Past the deadline with a full snapshot already taken: freeze what we had.
-  // Nothing the feed does afterwards can move it.
-  if (past && haveAll) {
+  for (const g of games) {
+    if (!weekDoc.gameIds.includes(g.id) || g.spreadHome === null) continue;
+    // Before the deadline every line tracks the feed. After it, only a game
+    // that never got a line at all can still be filled in — anything already
+    // captured is final and never moves again.
+    if (past && held[g.id] !== undefined) continue;
+    if (held[g.id] !== g.spreadHome) {
+      held[g.id] = g.spreadHome;
+      changed = true;
+    }
+  }
+
+  // The deadline locks the week even if a game's line never showed up. A
+  // missing number must never hold the whole week open.
+  const freezeNow = past && !weekDoc.linesFrozen;
+  if (!changed && !freezeNow) return weekDoc;
+
+  weekDoc.lines = held;
+  if (changed) weekDoc.linesUpdatedAt = Date.now();
+  if (freezeNow) {
     weekDoc.linesFrozen = true;
     weekDoc.linesFrozenAt = deadline;
-    await writeJSON(`week:${SEASON}:${week}`, weekDoc);
-    return weekDoc;
-  }
-
-  const lines = { ...held };
-  for (const g of games) {
-    if (weekDoc.gameIds.includes(g.id) && g.spreadHome !== null) lines[g.id] = g.spreadHome;
-  }
-  const coversAll = weekDoc.gameIds.every((id) => lines[id] !== undefined);
-  const changed = JSON.stringify(lines) !== JSON.stringify(held);
-  if (!changed && !(past && coversAll)) return weekDoc;
-
-  weekDoc.lines = lines;
-  weekDoc.linesUpdatedAt = Date.now();
-  if (past && coversAll) {
-    // Slate posted after the deadline — take the current number and freeze.
-    // A game whose line isn't out yet keeps syncing until it appears.
-    weekDoc.linesFrozen = true;
-    weekDoc.linesFrozenAt = Date.now();
   }
   await writeJSON(`week:${SEASON}:${week}`, weekDoc);
   return weekDoc;
@@ -282,8 +306,14 @@ async function loadWeek(week) {
 
 /* ------------------------ King of the Hill -------------------------- */
 /* Survivor: one team a week, must win outright, never the same team twice.
-   A loss ends your KOTH season; an outright tie keeps you alive but burns
-   the team. Missing a completed week entirely also ends it. */
+   A loss ends that life; an outright tie survives but burns the team. Missing
+   a completed week ends it too.
+   BUYBACK: losing your FIRST life in week 1-5 earns one second life, usable
+   only in the very next week — take a team that week and you're back in on
+   entry 2. Skip it and the option is gone. Two lives is the ceiling, and every
+   team used across both lives stays burned. */
+
+const BUYBACK_LAST_LOSS_WEEK = 5;
 
 function kothResult(game, team) {
   if (!game) return "none";
@@ -315,40 +345,87 @@ async function computeKoth(upto) {
 
   const out = {};
   for (const p of players) {
+    if (p.koth === false) {
+      out[p.id] = {
+        excluded: true, used: [], teams: [], entry: 0, entriesUsed: 0,
+        alive: false, eliminatedWeek: 0, reason: "not in KOTH", buybackWeek: 0,
+      };
+      continue;
+    }
+
     const used = [];
+    let entry = 1;          // which KOTH life they're on
+    let entriesUsed = 1;
+    let alive = true;
     let eliminatedWeek = 0;
     let reason = "";
+    let buybackWeek = 0;    // the one week a buyback may be taken
+
     for (const wk of weeks) {
       if (!wk.published) continue;
-      const entry = wk.picks[p.id];
-      const team = entry && entry.koth;
+      // The buyback is good for exactly one week; once it's behind us it's gone.
+      if (buybackWeek && wk.week > buybackWeek) buybackWeek = 0;
+
+      const picked = wk.picks[p.id];
+      const team = picked && picked.koth;
+
+      if (!alive) {
+        if (buybackWeek === wk.week && team) {
+          // Taking a team in the buyback week starts the second life.
+          alive = true;
+          entry = 2;
+          entriesUsed = 2;
+          eliminatedWeek = 0;
+          reason = "";
+          buybackWeek = 0;
+        } else {
+          // The window shuts the moment that week's picks lock, not when its
+          // games finish — otherwise it can close while picks are still open.
+          if (buybackWeek === wk.week && wk.firstKick && Date.now() >= wk.firstKick) {
+            buybackWeek = 0;
+          }
+          continue;
+        }
+      }
+
       if (!team) {
-        // Alive players who sit out a finished week are done.
-        if (!eliminatedWeek && wk.complete && (p.createdAt || 0) < wk.firstKick) {
+        // An alive player who sits out a finished week is done.
+        if (wk.complete && (p.createdAt || 0) < wk.firstKick) {
+          alive = false;
           eliminatedWeek = wk.week;
           reason = "missed the week";
+          if (entry === 1 && wk.week <= BUYBACK_LAST_LOSS_WEEK) buybackWeek = wk.week + 1;
         }
         continue;
       }
+
       const game = wk.games.find((g) => g.home === team || g.away === team);
       const result = kothResult(game, team);
       used.push({
         week: wk.week,
         team,
         result,
+        entry,
         opponent: game ? (game.home === team ? `@${game.away}` : `vs ${game.away}`) : "",
       });
-      if (!eliminatedWeek && result === "loss") {
+      if (result === "loss") {
+        alive = false;
         eliminatedWeek = wk.week;
         reason = `${team} lost`;
+        if (entry === 1 && wk.week <= BUYBACK_LAST_LOSS_WEEK) buybackWeek = wk.week + 1;
       }
     }
+
     out[p.id] = {
+      excluded: false,
       used,
-      teams: used.map((u) => u.team),
+      teams: used.map((u) => u.team), // burned across BOTH lives
+      entry,
+      entriesUsed,
+      alive,
       eliminatedWeek,
       reason,
-      alive: !eliminatedWeek,
+      buybackWeek,
     };
   }
   return out;
@@ -363,6 +440,29 @@ async function getKoth(upto) {
 }
 
 const dropKothMemo = () => store().delete("koth:memo").catch(() => {});
+
+/* Sealing helpers — strip one week's KOTH team from anything sent to the
+   whole league. Who picked stays visible; what they picked does not. */
+
+function sealPicks(rawPicks) {
+  const out = {};
+  for (const [id, entry] of Object.entries(rawPicks)) {
+    const { koth: hidden, ...rest } = entry;
+    out[id] = { ...rest, koth: "", kothIn: Boolean(hidden) };
+  }
+  return out;
+}
+
+function sealKoth(rawKoth, week) {
+  const out = {};
+  for (const [id, info] of Object.entries(rawKoth)) {
+    const used = info.used.map((u) =>
+      u.week === week ? { week: u.week, entry: u.entry, result: "pending", hidden: true } : u
+    );
+    out[id] = { ...info, used, teams: used.filter((u) => !u.hidden).map((u) => u.team) };
+  }
+  return out;
+}
 
 /* ------------------------- request handling ------------------------ */
 
@@ -397,6 +497,8 @@ export default async (req) => {
         return await handlePicks(body);
       case "avatar":
         return req.method === "POST" ? await handleAvatarSet(body) : await handleAvatarGet(url);
+      case "mine":
+        return await handleMine(body);
       case "admin":
         return await handleAdmin(body);
       default:
@@ -419,8 +521,17 @@ async function handleState(url) {
 
   const { doc: weekDoc, games, feed } = await loadWeek(week);
   const { at, stale, error } = feed;
-  const picks = await getPicks(week);
-  const koth = await getKoth(Math.max(week, Number(league.currentWeek) || 1));
+  const rawPicks = await getPicks(week);
+  const rawKoth = await getKoth(Math.max(week, Number(league.currentWeek) || 1));
+
+  // KOTH teams stay sealed until the first kickoff. Everyone can see WHO has
+  // picked; nobody sees WHAT until the games start. A signed-in player reads
+  // their own back through /api/mine.
+  const revealAt = lockTime(weekDoc, games);
+  const sealed = revealAt !== null && Date.now() < revealAt;
+
+  const picks = sealed ? sealPicks(rawPicks) : rawPicks;
+  const koth = sealed ? sealKoth(rawKoth, week) : rawKoth;
 
   // Roll the league forward once every game on the published slate is final.
   if (
@@ -457,13 +568,17 @@ async function handleState(url) {
       hasPin: Boolean(p.pinHash),
       active: p.active !== false,
       avatar: p.avatar || 0, // version stamp; 0 = no photo
+      koth: p.koth !== false,
     })),
+    kothSealed: sealed,
+    kothRevealAt: revealAt,
     slate: {
       gameIds: weekDoc.gameIds,
       published: weekDoc.published,
       reopened: !!weekDoc.reopened,
       linesFrozen: !!weekDoc.linesFrozen,
       linesAt: weekDoc.linesUpdatedAt || 0,
+      missingLines: weekDoc.gameIds.filter((id) => (weekDoc.lines || {})[id] === undefined),
     },
     locked: weekIsLocked(weekDoc, games),
     lockAt: lockTime(weekDoc, games),
@@ -495,13 +610,25 @@ async function handleSeason() {
     Array.from({ length: upto }, (_, i) => i + 1).map(async (w) => {
       const { doc, games } = await loadWeek(w);
       if (!doc.published || !doc.gameIds.length) return null;
-      const picks = await getPicks(w);
+      const raw = await getPicks(w);
       const slate = games.filter((g) => doc.gameIds.includes(g.id));
       if (!slate.length) return null;
-      return { week: w, gameIds: doc.gameIds, games: slate.map(compact), picks };
+      // Seal this week's KOTH here too, so the season view can't be used to
+      // peek at what the live week's picks are.
+      const kick = Math.min(...slate.map((g) => g.kickoff));
+      const sealed = Date.now() < kick;
+      return {
+        week: w,
+        gameIds: doc.gameIds,
+        games: slate.map(compact),
+        picks: sealed ? sealPicks(raw) : raw,
+        sealed,
+      };
     })
   );
-  const koth = await getKoth(upto);
+  const live = weeks.filter(Boolean).find((w) => w.sealed);
+  let koth = await getKoth(upto);
+  if (live) koth = sealKoth(koth, live.week);
   return json({ ok: true, weeks: weeks.filter(Boolean), koth });
 }
 
@@ -576,6 +703,20 @@ async function requireAdmin(body) {
   if (!league.adminPinHash || league.adminPinHash !== hash("admin", pin))
     return { error: fail("Wrong commissioner PIN.", 401) };
   return { league };
+}
+
+/* ------------------------------- mine ------------------------------ */
+/* KOTH picks are hidden from everyone until kickoff, so a signed-in player
+   needs an authenticated way to see their own. */
+
+async function handleMine(body) {
+  const { player, error } = await requirePlayer(body);
+  if (error) return error;
+  const league = await getLeague();
+  const week = Number(body.week) || Number(league.currentWeek) || 1;
+  const entry = await readJSON(`pick:${SEASON}:${week}:${player.id}`, null);
+  const koth = await getKoth(Math.max(week, Number(league.currentWeek) || 1));
+  return json({ ok: true, week, entry, koth: koth[player.id] || null });
 }
 
 /* ------------------------------ avatars ---------------------------- */
@@ -657,13 +798,21 @@ function validateEntry(entry, weekDoc, games, kothInfo) {
   if (!entry.lock || !weekDoc.gameIds.includes(entry.lock))
     return "Choose your Lock of the Week.";
 
-  // King of the Hill — only for players still alive.
+  // King of the Hill. Players out of KOTH entirely, or eliminated with no
+  // buyback available, simply carry no KOTH pick.
+  const buybackOpen = Boolean(kothInfo && kothInfo.buybackWeek === entry.week);
   const alive = !kothInfo || kothInfo.alive || kothInfo.eliminatedWeek >= entry.week;
-  if (!alive) {
+  if (kothInfo && kothInfo.excluded) {
+    entry.koth = "";
+    return null;
+  }
+  if (!alive && !buybackOpen) {
     entry.koth = "";
     return null;
   }
   const team = entry.koth;
+  // A buyback is optional — you may sit it out and stay eliminated.
+  if (!team && buybackOpen && !alive) return null;
   if (!team) return "Choose your King of the Hill team.";
   if (!games.some((g) => g.home === team || g.away === team))
     return `${team} isn't playing in Week ${entry.week}.`;
@@ -739,6 +888,23 @@ async function handleAdmin(body) {
     return json({ ok: true, slate: weekDoc });
   }
 
+  if (action === "freezeLines") {
+    const week = Number(body.week);
+    if (!(week >= 1 && week <= MAX_WEEK)) return fail("That week doesn't exist.");
+    const { doc, games } = await loadWeek(week);
+    if (!doc.published || !doc.gameIds.length) return fail("Post the slate first.");
+    const lines = { ...(doc.lines || {}) };
+    for (const g of games) {
+      if (doc.gameIds.includes(g.id) && g.spreadHome !== null) lines[g.id] = g.spreadHome;
+    }
+    doc.lines = lines;
+    doc.linesFrozen = true;
+    doc.linesFrozenAt = Date.now();
+    doc.linesUpdatedAt = Date.now();
+    await writeJSON(`week:${SEASON}:${week}`, doc);
+    return json({ ok: true, frozen: Object.keys(lines).length, of: doc.gameIds.length });
+  }
+
   if (action === "setReopened") {
     const week = Number(body.week);
     const weekDoc = await getWeekDoc(week);
@@ -767,6 +933,7 @@ async function handleAdmin(body) {
           name,
           pinHash: prior ? prior.pinHash : "",
           avatar: prior ? prior.avatar || 0 : 0,
+          koth: prior ? prior.koth !== false : true,
           active: p.active !== false,
           createdAt: prior ? prior.createdAt : Date.now(),
         };
@@ -775,6 +942,16 @@ async function handleAdmin(body) {
     if (!players.length) return fail("Keep at least one player.");
     await writeJSON("players", players);
     return json({ ok: true, players });
+  }
+
+  if (action === "setKothIn") {
+    const players = await getPlayers();
+    const player = players.find((p) => p.id === body.playerId);
+    if (!player) return fail("No such player.");
+    player.koth = Boolean(body.inKoth);
+    await writeJSON("players", players);
+    await dropKothMemo();
+    return json({ ok: true, koth: player.koth });
   }
 
   if (action === "resetPin") {
