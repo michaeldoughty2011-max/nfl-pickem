@@ -126,6 +126,17 @@
     return rec;
   }
 
+  /* Cached per sign-in; cleared whenever the player or the season data
+     changes so it can never go stale against whoever is signed in. */
+  function teamRecords() {
+    if (!S.season || !S.me) return null;
+    if (!S.teamRecords || S.teamRecordsFor !== S.me.playerId) {
+      S.teamRecords = myTeamRecords();
+      S.teamRecordsFor = S.me.playerId;
+    }
+    return S.teamRecords;
+  }
+
   const teamsPlaying = (games) => {
     const out = [];
     for (const g of games) {
@@ -601,20 +612,23 @@
     const res = resultFor(g, chosen);
     const started = g.state !== "pre";
 
-    const records = S.teamRecords;
+    // Every team carries a record once the season data is in, including the
+    // ones you've never taken — 0-0 is information too.
+    const records = teamRecords();
     const teamBtn = (team, score) => {
       const sel = chosen === team;
       const cls = ["team"];
       if (sel && started && res !== "pending" && res !== "none") cls.push(`result-${res}`);
-      const r = records && records[team];
+      const r = records && (records[team] || { w: 0, l: 0, t: 0 });
+      const none = r && !r.w && !r.l && !r.t;
       return `<button class="${cls.join(" ")}" ${editable ? "" : "disabled"} data-game="${g.id}" data-team="${team}"
         aria-pressed="${sel}">
         <span><span class="abbr">${team}</span> <span class="line num">${esc(lineFor(g, team))}</span>
         ${
           r
-            ? `<span class="yourrec num" title="Your record picking ${team} this season">you ${r.w}-${
-                r.l
-              }${r.t ? `-${r.t}` : ""}</span>`
+            ? `<span class="yourrec num${none ? " blank" : ""}" title="Your record picking ${team} against the spread this season">you ${
+                r.w
+              }-${r.l}${r.t ? `-${r.t}` : ""}</span>`
             : ""
         }</span>
         ${started ? `<span class="score">${score}</span>` : ""}
@@ -1015,7 +1029,7 @@
       toast(err.message, "bad");
     } finally {
       S.seasonLoading = false;
-      S.teamRecords = myTeamRecords();
+      S.teamRecords = null; // rebuilt on demand for whoever is signed in
       render();
     }
   }

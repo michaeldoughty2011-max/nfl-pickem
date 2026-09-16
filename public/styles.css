@@ -544,8 +544,9 @@ textarea { resize: vertical; min-height: 96px; font-family: inherit; }
   font-size: 11px;
   font-weight: 600;
   letter-spacing: .03em;
-  color: var(--ink-3);
+  color: var(--ink-2);
 }
+.yourrec.blank { color: var(--ink-3); opacity: .6; }
 
 /* ------------------------- earned status chart ---------------------- */
 
