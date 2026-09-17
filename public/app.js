@@ -103,37 +103,39 @@
   const gameForTeam = (games, team) =>
     games.find((g) => g.home === team || g.away === team) || null;
 
-  /* Your own season-to-date record picking a given team, against the spread.
-     Built from the season payload, which the Picks tab now loads too. */
-  function myTeamRecords() {
-    const id = S.me && S.me.playerId;
-    if (!id || !S.season) return null;
+  /* Each team's own season-to-date record against the spread — how often they
+     covered, across every game they've played, whether or not the pool picked
+     it. Both sides of a push get a tie. */
+  function teamAtsRecords() {
+    if (!S.season) return null;
     const rec = {};
+    const add = (team, key) => {
+      if (!team) return;
+      rec[team] = rec[team] || { w: 0, l: 0, t: 0 };
+      rec[team][key]++;
+    };
     for (const wk of S.season) {
-      const entry = wk.picks[id];
-      if (!entry) continue;
       for (const g of wk.games) {
-        const pick = entry.picks[g.id];
-        if (!pick || g.state !== "final") continue;
-        const r = resultFor(g, pick);
-        if (r !== "win" && r !== "loss" && r !== "push") continue;
-        rec[pick] = rec[pick] || { w: 0, l: 0, t: 0 };
-        if (r === "win") rec[pick].w++;
-        else if (r === "loss") rec[pick].l++;
-        else rec[pick].t++;
+        if (g.state !== "final") continue;
+        const m = coverMargin(g);
+        if (m === null) continue;
+        if (m === 0) {
+          add(g.home, "t");
+          add(g.away, "t");
+          continue;
+        }
+        add(m > 0 ? g.home : g.away, "w");
+        add(m > 0 ? g.away : g.home, "l");
       }
     }
     return rec;
   }
 
-  /* Cached per sign-in; cleared whenever the player or the season data
-     changes so it can never go stale against whoever is signed in. */
+  /* Built once per season payload — the same for everyone, so no per-player
+     cache to go stale. */
   function teamRecords() {
-    if (!S.season || !S.me) return null;
-    if (!S.teamRecords || S.teamRecordsFor !== S.me.playerId) {
-      S.teamRecords = myTeamRecords();
-      S.teamRecordsFor = S.me.playerId;
-    }
+    if (!S.season) return null;
+    if (!S.teamRecords) S.teamRecords = teamAtsRecords();
     return S.teamRecords;
   }
 
@@ -612,21 +614,22 @@
     const res = resultFor(g, chosen);
     const started = g.state !== "pre";
 
-    // Every team carries a record once the season data is in, including the
-    // ones you've never taken — 0-0 is information too.
     const records = teamRecords();
     const teamBtn = (team, score) => {
       const sel = chosen === team;
       const cls = ["team"];
       if (sel && started && res !== "pending" && res !== "none") cls.push(`result-${res}`);
       const r = records && (records[team] || { w: 0, l: 0, t: 0 });
-      const none = r && !r.w && !r.l && !r.t;
+      const played = r && r.w + r.l + r.t > 0;
+      // Green when they cover more than they don't, red the other way,
+      // yellow dead even. No games yet stays neutral.
+      const tone = !played ? "blank" : r.w > r.l ? "win" : r.l > r.w ? "loss" : "push";
       return `<button class="${cls.join(" ")}" ${editable ? "" : "disabled"} data-game="${g.id}" data-team="${team}"
         aria-pressed="${sel}">
         <span><span class="abbr">${team}</span> <span class="line num">${esc(lineFor(g, team))}</span>
         ${
           r
-            ? `<span class="yourrec num${none ? " blank" : ""}" title="Your record picking ${team} against the spread this season">you ${
+            ? `<span class="yourrec num ${tone}" title="${team} against the spread this season">ATS ${
                 r.w
               }-${r.l}${r.t ? `-${r.t}` : ""}</span>`
             : ""

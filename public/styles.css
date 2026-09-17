@@ -542,11 +542,14 @@ textarea { resize: vertical; min-height: 96px; font-family: inherit; }
   display: block;
   margin-top: 2px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: .03em;
   color: var(--ink-2);
 }
-.yourrec.blank { color: var(--ink-3); opacity: .6; }
+.yourrec.win { color: var(--win); }
+.yourrec.loss { color: var(--loss); }
+.yourrec.push { color: var(--push); }
+.yourrec.blank { color: var(--ink-3); opacity: .55; }
 
 /* ------------------------- earned status chart ---------------------- */
 
