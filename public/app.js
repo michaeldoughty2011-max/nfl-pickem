@@ -103,39 +103,39 @@
   const gameForTeam = (games, team) =>
     games.find((g) => g.home === team || g.away === team) || null;
 
-  /* Each team's own season-to-date record against the spread — how often they
-     covered, across every game they've played, whether or not the pool picked
-     it. Both sides of a push get a tie. */
-  function teamAtsRecords() {
-    if (!S.season) return null;
+  /* YOUR record picking each team: every time you took them in a previous
+     Pick'em week, did that pick win, lose or push? Graded against the spread,
+     because that's how picks are graded — but it counts only the games you
+     actually picked, so a team you've never taken sits at 0-0. */
+  function myPickRecords() {
+    const id = S.me && S.me.playerId;
+    if (!id || !S.season) return null;
     const rec = {};
-    const add = (team, key) => {
-      if (!team) return;
-      rec[team] = rec[team] || { w: 0, l: 0, t: 0 };
-      rec[team][key]++;
-    };
     for (const wk of S.season) {
+      const entry = wk.picks[id];
+      if (!entry || !entry.picks) continue;
+      const onSlate = new Set(wk.gameIds);
       for (const g of wk.games) {
-        if (g.state !== "final") continue;
-        const m = coverMargin(g);
-        if (m === null) continue;
-        if (m === 0) {
-          add(g.home, "t");
-          add(g.away, "t");
-          continue;
-        }
-        add(m > 0 ? g.home : g.away, "w");
-        add(m > 0 ? g.away : g.home, "l");
+        if (!onSlate.has(g.id) || g.state !== "final") continue;
+        const pick = entry.picks[g.id];
+        if (!pick) continue;
+        const r = resultFor(g, pick);
+        if (r !== "win" && r !== "loss" && r !== "push") continue;
+        rec[pick] = rec[pick] || { w: 0, l: 0, t: 0 };
+        rec[pick][r === "win" ? "w" : r === "loss" ? "l" : "t"]++;
       }
     }
     return rec;
   }
 
-  /* Built once per season payload — the same for everyone, so no per-player
-     cache to go stale. */
+  /* Cached per signed-in player, rebuilt when the player or the season data
+     changes so it can never belong to the wrong person. */
   function teamRecords() {
-    if (!S.season) return null;
-    if (!S.teamRecords) S.teamRecords = teamAtsRecords();
+    if (!S.season || !S.me) return null;
+    if (!S.teamRecords || S.teamRecordsFor !== S.me.playerId) {
+      S.teamRecords = myPickRecords();
+      S.teamRecordsFor = S.me.playerId;
+    }
     return S.teamRecords;
   }
 
@@ -629,7 +629,7 @@
         <span><span class="abbr">${team}</span> <span class="line num">${esc(lineFor(g, team))}</span>
         ${
           r
-            ? `<span class="yourrec num ${tone}" title="${team} against the spread this season">ATS ${
+            ? `<span class="yourrec num ${tone}" title="Your record when you pick ${team}">You ${
                 r.w
               }-${r.l}${r.t ? `-${r.t}` : ""}</span>`
             : ""
