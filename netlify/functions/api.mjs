@@ -620,7 +620,9 @@ async function handleSeason() {
       return {
         week: w,
         gameIds: doc.gameIds,
-        games: slate.map(compact),
+        // Every game of the week, not just the slate — team ATS records count
+        // games the pool didn't pick. Consumers filter by gameIds for scoring.
+        games: games.map(compact),
         picks: sealed ? sealPicks(raw) : raw,
         sealed,
       };
