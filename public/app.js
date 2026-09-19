@@ -211,6 +211,85 @@
     )} 50% 40%);color:#fff">${esc(initialsOf(p.name))}</span>`;
   }
 
+  /* ---------------------------- notifications ----------------------- */
+
+  const pushSupported = () =>
+    "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+
+  // iOS only delivers Web Push to a PWA that's been added to the Home Screen.
+  const isIOS = () =>
+    /iphone|ipad|ipod/i.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const installed = () =>
+    window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+
+  const urlB64ToUint8 = (b64) => {
+    const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+    const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+    return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+  };
+
+  async function pushState() {
+    if (!pushSupported()) return "unsupported";
+    if (isIOS() && !installed()) return "needs-install";
+    if (Notification.permission === "denied") return "blocked";
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      return sub ? "on" : "off";
+    } catch {
+      return "off";
+    }
+  }
+
+  async function enablePush() {
+    try {
+      if (!S.me) throw new Error("Sign in first so the message knows who you are.");
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") throw new Error("Notifications stayed off.");
+      const { key } = await api("/api/push?action=key");
+      const reg = await navigator.serviceWorker.ready;
+      const sub =
+        (await reg.pushManager.getSubscription()) ||
+        (await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlB64ToUint8(key),
+        }));
+      await api("/api/push", {
+        action: "subscribe",
+        playerId: S.me.playerId,
+        pin: S.me.pin,
+        subscription: sub.toJSON(),
+      });
+      toast("Notifications on for this device.", "info");
+      closeModal();
+      render();
+    } catch (err) {
+      toast(err.message, "bad");
+    }
+  }
+
+  async function disablePush() {
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        await api("/api/push", {
+          action: "unsubscribe",
+          playerId: S.me.playerId,
+          pin: S.me.pin,
+          endpoint: sub.endpoint,
+        });
+        await sub.unsubscribe();
+      }
+      toast("Notifications off for this device.", "info");
+      closeModal();
+      render();
+    } catch (err) {
+      toast(err.message, "bad");
+    }
+  }
+
   const loadImage = (file) =>
     new Promise((resolve, reject) => {
       const url = URL.createObjectURL(file);
@@ -1391,6 +1470,21 @@
       </section>
 
       <section class="section">
+        <div class="section-head"><div><p class="eyebrow">Commissioner</p><h2>Message the league</h2></div>
+          <span class="eyebrow" id="pushReach">—</span></div>
+        <div class="panel panel-pad" style="display:flex;flex-direction:column;gap:10px">
+          <div class="field"><label for="msgTitle">Headline</label>
+            <input id="msgTitle" type="text" maxlength="60" placeholder="Pickem" value="Pickem"></div>
+          <div class="field"><label for="msgBody">Message</label>
+            <textarea id="msgBody" maxlength="300" placeholder="Reminder — picks in by 1pm ET Sunday sharp."></textarea></div>
+          <div class="row">
+            <span class="grow note">Goes to every phone that's turned alerts on. It can't reach anyone who hasn't.</span>
+            <button class="btn" id="sendMsg">Send</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
         <div class="section-head"><h2>Players</h2><span class="eyebrow">${
           d.players.length
         } in the pool</span></div>
@@ -1481,6 +1575,37 @@
       };
 
     $("#pickFor").onclick = () => openPickForModal();
+
+    api("/api/admin", { adminPin: S.adminPin, action: "pushCount" })
+      .then((r) => {
+        const el = $("#pushReach");
+        if (el) el.textContent = `${r.players}/${S.data.players.length} on`;
+      })
+      .catch(() => {});
+
+    $("#sendMsg").onclick = async (e) => {
+      const message = $("#msgBody").value.trim();
+      if (!message) return toast("Write a message first.", "bad");
+      if (!confirm(`Send this to the league?\n\n${message}`)) return;
+      e.target.disabled = true;
+      try {
+        const r = await api("/api/admin", {
+          adminPin: S.adminPin,
+          action: "broadcast",
+          title: $("#msgTitle").value,
+          message,
+        });
+        toast(
+          `Sent to ${r.sent} of ${r.attempted} device${r.attempted === 1 ? "" : "s"}.`,
+          "info"
+        );
+        $("#msgBody").value = "";
+      } catch (err) {
+        toast(err.message, "bad");
+      } finally {
+        e.target.disabled = false;
+      }
+    };
 
     $("#addPlayer").onclick = () => {
       const name = $("#newPlayer").value.trim();
@@ -1587,6 +1712,11 @@
            </div>
          </div>
          <p class="note">Your photo shows up next to your name on the board. It's resized on your phone before it uploads, so a full-size camera roll picture is fine.</p>
+         <hr class="rule">
+         <div class="row">
+           <span class="grow note" id="pushNote">Alerts from the commissioner — checking…</span>
+           <span id="pushBtnSlot"></span>
+         </div>
          <hr class="rule">`
       : "";
 
@@ -1612,6 +1742,8 @@
       .querySelectorAll("[data-pick-player]")
       .forEach((b) => (b.onclick = () => askPin(b.dataset.pickPlayer)));
 
+    if (me) paintPushRow();
+
     const pick = $("#photoPick");
     if (pick) pick.onclick = () => changePhoto(me.id);
     const drop = $("#photoDrop");
@@ -1626,6 +1758,33 @@
         resetDraft();
         render();
       };
+  }
+
+  async function paintPushRow() {
+    const note = $("#pushNote");
+    const slot = $("#pushBtnSlot");
+    if (!note || !slot) return;
+    const state = await pushState();
+    const copy = {
+      on: "Alerts from the commissioner are on for this device.",
+      off: "Get a phone alert when the commissioner sends word.",
+      blocked:
+        "Alerts are blocked for this site in your phone's settings — turn them back on there first.",
+      "needs-install":
+        "On iPhone, alerts only work once the app is on your Home Screen. Share button → Add to Home Screen, then open it from there.",
+      unsupported: "This browser can't do alerts. Try Safari on iPhone or Chrome on Android.",
+    };
+    note.textContent = copy[state];
+    slot.innerHTML =
+      state === "on"
+        ? `<button class="btn ghost" id="pushOff" style="padding:7px 12px">Turn off</button>`
+        : state === "off"
+        ? `<button class="btn" id="pushOn" style="padding:7px 12px">Turn on</button>`
+        : "";
+    const on = $("#pushOn");
+    if (on) on.onclick = enablePush;
+    const off = $("#pushOff");
+    if (off) off.onclick = disablePush;
   }
 
   function askPin(playerId) {
