@@ -1,5 +1,6 @@
 import { getStore } from "@netlify/blobs";
 import crypto from "node:crypto";
+import webpush from "web-push";
 
 /* ------------------------------------------------------------------ *
  * Weekly NFL Pick'em — single API function.
@@ -499,6 +500,8 @@ export default async (req) => {
         return req.method === "POST" ? await handleAvatarSet(body) : await handleAvatarGet(url);
       case "mine":
         return await handleMine(body);
+      case "push":
+        return await handlePush(body, url);
       case "admin":
         return await handleAdmin(body);
       default:
@@ -705,6 +708,113 @@ async function requireAdmin(body) {
   if (!league.adminPinHash || league.adminPinHash !== hash("admin", pin))
     return { error: fail("Wrong commissioner PIN.", 401) };
   return { league };
+}
+
+/* ---------------------------- push alerts -------------------------- */
+/* The signing keys are generated on the server the first time they're
+   needed and kept in the store — never in the repo, which is public. Each
+   player's device subscriptions live in their own document so two phones
+   subscribing at once can't clobber each other. */
+
+async function vapid() {
+  let keys = await readJSON("push:vapid", null);
+  if (!keys || !keys.publicKey || !keys.privateKey) {
+    keys = webpush.generateVAPIDKeys();
+    await writeJSON("push:vapid", keys);
+  }
+  return keys;
+}
+
+const subKey = (playerId) => `push:sub:${playerId}`;
+
+async function listSubs() {
+  const out = [];
+  try {
+    const { blobs } = await store().list({ prefix: "push:sub:" });
+    await Promise.all(
+      blobs.map(async (b) => {
+        const rec = await readJSON(b.key, null);
+        if (rec && Array.isArray(rec.subs)) {
+          for (const s of rec.subs) out.push({ playerId: rec.playerId, sub: s });
+        }
+      })
+    );
+  } catch {
+    /* nobody subscribed yet */
+  }
+  return out;
+}
+
+async function handlePush(body, url) {
+  const action = String(body.action || url.searchParams.get("action") || "key");
+
+  if (action === "key") {
+    const { publicKey } = await vapid();
+    return json({ ok: true, key: publicKey });
+  }
+
+  const { player, error } = await requirePlayer(body);
+  if (error) return error;
+  const rec = (await readJSON(subKey(player.id), null)) || { playerId: player.id, subs: [] };
+
+  if (action === "subscribe") {
+    const sub = body.subscription;
+    if (!sub || !sub.endpoint) return fail("That subscription didn't come through.");
+    rec.subs = rec.subs.filter((s) => s.endpoint !== sub.endpoint);
+    rec.subs.push(sub);
+    if (rec.subs.length > 6) rec.subs = rec.subs.slice(-6); // a few devices each, no more
+    rec.updatedAt = Date.now();
+    await writeJSON(subKey(player.id), rec);
+    return json({ ok: true, devices: rec.subs.length });
+  }
+
+  if (action === "unsubscribe") {
+    rec.subs = rec.subs.filter((s) => s.endpoint !== body.endpoint);
+    await writeJSON(subKey(player.id), rec);
+    return json({ ok: true, devices: rec.subs.length });
+  }
+
+  return fail("Unknown notification action.");
+}
+
+async function broadcast({ title, body, url }) {
+  const keys = await vapid();
+  webpush.setVapidDetails("mailto:commish@pickem.local", keys.publicKey, keys.privateKey);
+
+  const targets = await listSubs();
+  const payload = JSON.stringify({
+    title: title || "Pickem",
+    body: body || "",
+    url: url || "/",
+  });
+
+  let sent = 0;
+  const dead = new Map(); // playerId -> endpoints to drop
+
+  await Promise.all(
+    targets.map(async ({ playerId, sub }) => {
+      try {
+        await webpush.sendNotification(sub, payload);
+        sent++;
+      } catch (err) {
+        const code = err && err.statusCode;
+        // 404/410 mean the browser threw the subscription away.
+        if (code === 404 || code === 410) {
+          if (!dead.has(playerId)) dead.set(playerId, []);
+          dead.get(playerId).push(sub.endpoint);
+        }
+      }
+    })
+  );
+
+  for (const [playerId, endpoints] of dead) {
+    const rec = await readJSON(subKey(playerId), null);
+    if (!rec) continue;
+    rec.subs = rec.subs.filter((s) => !endpoints.includes(s.endpoint));
+    await writeJSON(subKey(playerId), rec);
+  }
+
+  return { sent, attempted: targets.length, pruned: [...dead.values()].flat().length };
 }
 
 /* ------------------------------- mine ------------------------------ */
@@ -944,6 +1054,23 @@ async function handleAdmin(body) {
     if (!players.length) return fail("Keep at least one player.");
     await writeJSON("players", players);
     return json({ ok: true, players });
+  }
+
+  if (action === "broadcast") {
+    const text = String(body.message || "").trim().slice(0, 300);
+    if (!text) return fail("Write a message first.");
+    const res = await broadcast({
+      title: String(body.title || "Pickem").trim().slice(0, 60) || "Pickem",
+      body: text,
+      url: "/",
+    });
+    return json({ ok: true, ...res });
+  }
+
+  if (action === "pushCount") {
+    const targets = await listSubs();
+    const players = new Set(targets.map((t) => t.playerId));
+    return json({ ok: true, devices: targets.length, players: players.size });
   }
 
   if (action === "setKothIn") {
